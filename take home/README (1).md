@@ -1,33 +1,80 @@
-# Comm-Log Reconciliation
+# Comm-Log Reconciliation — Data Dictionary
 
-Merchant 501, October 2026. Finance's reported `target_base` is 22 — this is how I arrived at that number.
+This is the raw data for the take-home in `ASSIGNMENT.md`. Everything you need is either
+in the schema below or discoverable by querying the data itself.
 
-I started with the simplest query I could think of and worked forward from there, checking against 22 after every change, instead of starting from the rules and writing one clean query top-down.
+## Loading the data
 
-## Reconciliation Bridge
+`data/comm_log.db` is a SQLite database with two tables (also available as
+`data/campaign.csv` and `data/communication_log.csv` if you prefer a different tool).
 
-| Step | Description | Result | Reason |
-|------|------|------|--------|
-| 0 | Naive count — `SELECT COUNT(*) FROM communication_log;` | 30 | Starting point: count of all send rows for merchant 501, October 2026, Diwali campaigns |
-| 1 | Excluded campaign 9004 | 26 | `creation_status = 'approval_awaiting'` — this campaign's sends already exist in `communication_log`, but the approval workflow hadn't cleared yet, so it shouldn't count toward reported sends |
-| 2 | Collapsed retry chain 9001 → 9002 → 9003 to distinct customers | 10 | These three campaigns represent retries of the same underlying communication (`parent_id` chains back to 9001). A customer retried multiple times within this chain should be counted once, not once per attempt |
-| 3 | Collapsed retry chain 9201 → 9202 to distinct customers | 5 | Same logic as above — 9202 is a retry of 9201 |
-| 4 | Kept campaign 9101 rows as-is | 7 | 9101 has no parent and no retries pointing at it, so it's a standalone communication. Every send under it is a separate event, even when the same customer (C20) appears twice |
-| **Final** | 10 + 5 + 7 | **22** | Matches Finance's reported `target_base` |
+```
+sqlite3 data/comm_log.db
+.tables
+.schema campaign
+.schema communication_log
+```
 
-I got to 26 pretty quickly since campaign 9004 stood out on its own — its `creation_status` was different from every other row, and honestly its name gave it away too ("Retry C (pending)"). The retry chains took a bit longer to notice since I had to actually look at `parent_id` instead of just eyeballing the campaign names, and 9101 was the last piece — I almost collapsed it the same way as the other two chains before realizing it isn't a chain at all, nothing points to it and it points to nothing.
+## Table: `campaign`
 
-## SQL Query
+One row per campaign. A campaign can be a **retry** of an earlier campaign — this is
+how the system represents "we re-sent to customers who didn't respond/failed on a
+previous attempt."
 
-See `query.sql` for two versions, both returning 22:
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | int | Campaign id. |
+| `merchant_id` | int | Owning merchant. |
+| `parent_id` | int, nullable | If set, this campaign is a retry attempt of `parent_id`. NULL means this campaign was not created as a retry of anything (it may still have its own retries pointing at it). |
+| `name` | text | Human-readable label. |
+| `creation_status` | text | Lifecycle state of the campaign's *creation/approval* workflow. Values seen in this dataset: `approved`, `approval_awaiting`. Other real values include `aborted`, `resumed`, `stopped` (all of these, plus `approved`, are considered finalized/live for reporting purposes). `approval_awaiting` means the campaign has not cleared approval yet. |
+| `processing_status` | text | Lifecycle state of the campaign's *send* workflow. `processed` means the send pipeline has finished running for this campaign. |
 
-1. **Direct query** — built from the specific campaign IDs I identified during the investigation (9001–9003, 9201–9202, 9101). This is basically the query that matches the bridge above step-by-step.
-2. **Generalized query** — uses a recursive CTE to identify retry chains automatically via `parent_id`, excludes campaigns still in `approval_awaiting`, then counts distinct customers within each retry chain and raw row counts for standalone campaigns. I wrote this version because the first one felt like it was cheating a bit — I already knew where the campaign IDs were, so hardcoding them into the query doesn't really prove the logic is right, it just proves I can plug in numbers I already found manually. This version would still hold up even if the chain structure changed or new campaigns got added.
+**A campaign is included in official reporting only once both its creation workflow
+has cleared (`creation_status` in the finalized set above) and its processing has
+completed (`processing_status = 'processed'`).** A campaign still `approval_awaiting`
+has not been signed off and does not count toward reported sends, even if
+`communication_log` rows already exist for it (the send pipeline can run ahead of
+approval bookkeeping catching up).
 
-I also tested the generalized version against a few slightly modified copies of the data (marking a mid-chain campaign as pending, adding a duplicate standalone send, and reusing a customer ID across two different chains) just to make sure 22 wasn't a coincidence tied to this one file — all three came back with the numbers I expected, which gave me some confidence the logic actually generalizes and isn't just fit to this dataset.
+## Table: `communication_log`
 
-## What Surprised Me
+One row per individual send attempt.
 
-Campaign 9004 already had send rows in `communication_log` even though its `creation_status` was still `approval_awaiting` — the send pipeline had run ahead of the approval workflow, which wasn't something I expected going in. I'd have assumed sends physically can't go out before a campaign is approved, but apparently that's not how the system works.
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | int | Row id (one per send attempt). |
+| `merchant_id` | int | Owning merchant. |
+| `communication_id` | int | FK to `campaign.id` — which campaign this attempt belongs to. |
+| `customer_id` | text | Customer targeted. |
+| `communication_type` | text | `'2'` = Campaign (the only type in this dataset). |
+| `delivery_status` | int | `900` = delivered successfully. `1100` = failed (soft failure — the customer may be retried via a new campaign row, or genuinely re-targeted later). |
+| `sent_time` / `scheduled_time` | timestamp | When the send happened / was scheduled. |
+| `credit_used` | int | Billing credits consumed by this attempt. |
+| `channel` | text | Send channel (`sms` throughout this dataset). |
 
-I also noticed a single customer (C20) appeared twice against the standalone campaign (9101), on two different dates. At first glance this looked exactly like the retry pattern I'd just handled for the other campaigns, so my first instinct was to collapse it too. But since 9101 has no `parent_id` and nothing points back at it, both sends count as separate events rather than being collapsed — which turned out to be the one adjustment that actually pushed the number up instead of down.
+**A customer can legitimately appear more than once against the same `communication_id`.**
+This happens when a campaign is independently re-run or a customer is re-targeted after
+falling back into the audience — it is a separate event from a *retry*, which always
+creates a **new** campaign row (`campaign.parent_id` pointing back at the original).
+
+## Retry chains
+
+If campaign B has `parent_id = A`, B represents "the same underlying communication,
+re-attempted." A chain can be more than two levels deep (A -> B -> C). A customer who
+was sent A (and failed), then B (and failed), then C (and delivered) was targeted by
+the *same underlying communication* three times — not three independent communications.
+
+## What "reporting" considers a qualifying send
+
+Finance's `target_base` metric answers: **for a given underlying communication (a
+campaign plus every retry chained off it), how many distinct customers were reached?**
+A customer who took several attempts within one retry chain to finally get delivered
+still counts once. A campaign with no retry chain at all (no other campaign points at
+it, and it points at nothing) is a standalone communication — every send under it is
+its own event, whether or not the same customer appears twice.
+
+## Scope for this exercise
+
+All data is for `merchant_id = 501`, sends in October 2026, `communication_type = '2'`
+(Campaign) only.
